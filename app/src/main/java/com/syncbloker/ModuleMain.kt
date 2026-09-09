@@ -5,7 +5,15 @@ import android.app.Activity
 import android.content.ContentResolver
 import android.content.ContentValues
 import android.content.Context
+import android.credentials.CredentialManager
+import android.credentials.CreateCredentialException
+import android.credentials.CreateCredentialRequest
+import android.credentials.CreateCredentialResponse
 import android.net.Uri
+import android.os.Bundle
+import android.os.CancellationSignal
+import android.os.OutcomeReceiver
+import android.util.Base64
 import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
@@ -17,7 +25,9 @@ import org.luckypray.dexkit.result.FieldUsingType
 import java.lang.reflect.Constructor
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
+import java.util.concurrent.Executor
 import java.util.WeakHashMap
+import org.json.JSONArray
 
 /**
  * LSPosed (API 101) 模块。
@@ -65,6 +75,14 @@ class ModuleMain : XposedModule() {
         private const val UNSYNC_MARK = "未同步"
         private const val FIDO_URI = "content://miui.autofill/fido_credential_summary_record"
         private const val FIDO_SYNC_URI = "content://miui.autofill/fido_credential_summary_record/sync"
+        private const val PUBLIC_KEY_TYPE = "androidx.credentials.TYPE_PUBLIC_KEY_CREDENTIAL"
+        private const val PUBLIC_KEY_SUBTYPE = "androidx.credentials.BUNDLE_KEY_SUBTYPE"
+        private const val CREATE_PUBLIC_KEY_SUBTYPE =
+            "androidx.credentials.BUNDLE_VALUE_SUBTYPE_CREATE_PUBLIC_KEY_CREDENTIAL_REQUEST"
+        private const val PUBLIC_KEY_REQUEST_JSON = "androidx.credentials.BUNDLE_KEY_REQUEST_JSON"
+        private const val PUBLIC_KEY_CLIENT_DATA_HASH = "androidx.credentials.BUNDLE_KEY_CLIENT_DATA_HASH"
+        private const val PUBLIC_KEY_REGISTRATION_RESPONSE_JSON =
+            "androidx.credentials.BUNDLE_KEY_REGISTRATION_RESPONSE_JSON"
     }
 
     /** 未同步（exchangeStatus != 0）通行密钥的 accountUUID 集合。 */
@@ -109,6 +127,7 @@ class ModuleMain : XposedModule() {
                     safeHook("fidoSync") { hookSyncEnableFido() }
                     safeHook("nokNokWhitelist") { hookNokNokWhitelist(param) }
                     safeHook("vendorValidate") { hookFidoVendorValidate(param) }
+                    safeHook("fidoHybridAospCreate") { hookFidoHybridAospCreate(param) }
                     safeHook("fidoHybridBoundaryProbe") { hookFidoHybridBoundaryProbe(param) }
                 }
                 TARGET_PACKAGE_CREDMAN -> {
@@ -616,6 +635,216 @@ class ModuleMain : XposedModule() {
 
         log(Log.INFO, TAG, "hooked FIDO Hybrid boundary probe")
     }
+
+    /**
+     * 扫码连电脑的 MakeCredential 先交给系统 CredentialManager。
+     *
+     * Hybrid 的 CTAP 请求只有 clientDataHash，没有浏览器侧的完整 clientDataJSON，
+     * 所以这里用一个合法的 WebAuthn options JSON 作为 provider 的输入，同时把原始
+     * clientDataHash 放入 AndroidX/AOSP 约定的 bundle。provider 返回的
+     * attestationObject 本身就是 CTAP MakeCredential 的 CBOR payload，前面补成功状态
+     * 字节即可交回 Hybrid executor。GetAssertion 暂时继续走原来的小米路径。
+     */
+    private fun hookFidoHybridAospCreate(param: PackageReadyParam) {
+        val cl = param.classLoader
+        val requestClass = Class.forName("b3.m0", false, cl)
+        val callbackClass = Class.forName("m2.a\$a", false, cl)
+        val executorClass = Class.forName("j2.h", false, cl)
+        val strategyClass = Class.forName("m2.d", false, cl)
+        val boundary = strategyClass.getDeclaredMethod(
+            "h",
+            executorClass,
+            requestClass,
+            callbackClass,
+        ).apply { isAccessible = true }
+
+        hook(boundary)
+            .setPriority(XposedInterface.PRIORITY_HIGHEST)
+            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+            .intercept { chain ->
+                val request = chain.getArg(1)
+                if (request?.javaClass?.name != "b3.u") {
+                    chain.proceed()
+                } else {
+                    val callback = chain.getArg(2)
+                    val applicationContext = readField(chain.thisObject, "f8539a", "a") as? Context
+                    val context = resolveHybridActivity(chain.getArg(0)) ?: applicationContext
+                    if (callback == null || context == null) {
+                        log(Log.WARN, TAG, "AOSP create bridge: missing callback/context, fallback Xiaomi")
+                        chain.proceed()
+                    } else {
+                        try {
+                            if (launchAospCreate(context, request, callback)) {
+                                null
+                            } else {
+                                log(Log.WARN, TAG, "AOSP create bridge: request conversion failed, fallback Xiaomi")
+                                chain.proceed()
+                            }
+                        } catch (t: Throwable) {
+                            log(Log.WARN, TAG, "AOSP create bridge failed, fallback Xiaomi: ${t.message}")
+                            chain.proceed()
+                        }
+                    }
+                }
+        }
+
+        log(Log.INFO, TAG, "hooked FIDO Hybrid MakeCredential -> AOSP CredentialManager")
+    }
+
+    private fun resolveHybridActivity(executor: Any?): Activity? {
+        val activityState = readField(executor, "f6686b", "b") ?: return null
+        return runCatching {
+            activityState.javaClass.getMethod("j").invoke(activityState) as? Activity
+        }.getOrNull()
+    }
+
+    private fun launchAospCreate(context: Context, request: Any, callback: Any): Boolean {
+        val requestJson = buildCreateRequestJson(request) ?: return false
+        val clientDataHash = readField(request, "f2631a", "a") as? ByteArray ?: return false
+        if (clientDataHash.isEmpty()) return false
+
+        val credentialData = Bundle().apply {
+            putString(PUBLIC_KEY_SUBTYPE, CREATE_PUBLIC_KEY_SUBTYPE)
+            putString(PUBLIC_KEY_REQUEST_JSON, requestJson)
+            putByteArray(PUBLIC_KEY_CLIENT_DATA_HASH, clientDataHash)
+        }
+        val candidateQueryData = Bundle(credentialData)
+        val frameworkRequest = CreateCredentialRequest.Builder(
+            PUBLIC_KEY_TYPE,
+            credentialData,
+            candidateQueryData,
+        )
+            .setAlwaysSendAppInfoToProvider(true)
+            .build()
+        val manager = context.getSystemService(CredentialManager::class.java) ?: return false
+        val executor: Executor = context.mainExecutor
+
+        log(
+            Log.INFO,
+            TAG,
+            "AOSP create bridge launch rp=${readField(readField(request, "f2632b", "b"), "id")}" +
+                " user=${readField(readField(request, "f2633c", "c"), "name")}",
+        )
+        manager.createCredential(
+            context,
+            frameworkRequest,
+            null as CancellationSignal?,
+            executor,
+            object : OutcomeReceiver<CreateCredentialResponse, CreateCredentialException> {
+                override fun onResult(result: CreateCredentialResponse) {
+                    try {
+                        val responseJson = result.data.getString(PUBLIC_KEY_REGISTRATION_RESPONSE_JSON)
+                        val attestationObject = responseJson
+                            ?.let { JSONObject(it).optString("attestationObject") }
+                            ?.takeIf { it.isNotEmpty() }
+                            ?.let { decodeBase64Url(it) }
+                        if (attestationObject == null || attestationObject.isEmpty()) {
+                            log(Log.ERROR, TAG, "AOSP create bridge: provider returned no attestationObject")
+                            invokeHybridError(callback, 127)
+                            return
+                        }
+                        val ctapResponse = ByteArray(attestationObject.size + 1)
+                        ctapResponse[0] = 0
+                        System.arraycopy(attestationObject, 0, ctapResponse, 1, attestationObject.size)
+                        log(Log.INFO, TAG, "AOSP create bridge success attestationBytes=${attestationObject.size}")
+                        invokeHybridSuccess(callback, ctapResponse)
+                    } catch (t: Throwable) {
+                        log(Log.ERROR, TAG, "AOSP create bridge response conversion failed: ${t.message}", t)
+                        invokeHybridError(callback, 127)
+                    }
+                }
+
+                override fun onError(error: CreateCredentialException) {
+                    log(Log.WARN, TAG, "AOSP create bridge provider error: ${error.message}")
+                    invokeHybridError(callback, 127)
+                }
+            },
+        )
+        return true
+    }
+
+    private fun buildCreateRequestJson(request: Any): String? {
+        val rp = readField(request, "f2632b", "b") ?: return null
+        val user = readField(request, "f2633c", "c") ?: return null
+        val rpId = readField(rp, "id") as? String ?: return null
+        val userId = readField(user, "id") as? ByteArray ?: return null
+        val userName = readField(user, "name") as? String ?: return null
+        val clientDataHash = readField(request, "f2631a", "a") as? ByteArray ?: return null
+
+        val json = JSONObject()
+        json.put("challenge", encodeBase64Url(clientDataHash))
+        json.put("rp", JSONObject().apply {
+            put("id", rpId)
+            (readField(rp, "name") as? String)?.let { put("name", it) }
+        })
+        json.put("user", JSONObject().apply {
+            put("id", encodeBase64Url(userId))
+            put("name", userName)
+            put("displayName", (readField(user, "displayName") as? String).orEmpty().ifEmpty { userName })
+        })
+
+        val parameters = JSONArray()
+        val parameterList = readField(request, "f2634d", "d") as? Iterable<*>
+        parameterList?.forEach { parameter ->
+            val algorithm = readAlgorithm(parameter) ?: return@forEach
+            parameters.put(JSONObject().apply {
+                put("type", "public-key")
+                put("alg", algorithm)
+            })
+        }
+        if (parameters.length() == 0) return null
+        json.put("pubKeyCredParams", parameters)
+
+        val excludeList = readField(request, "f2635e", "e") as? Iterable<*>
+        if (excludeList != null) {
+            val exclude = JSONArray()
+            excludeList.forEach { descriptor ->
+                val id = readField(descriptor, "id") as? ByteArray ?: return@forEach
+                exclude.put(JSONObject().apply {
+                    put("type", "public-key")
+                    put("id", encodeBase64Url(id))
+                })
+            }
+            if (exclude.length() > 0) json.put("excludeCredentials", exclude)
+        }
+
+        val options = readField(request, "f2637g", "g")
+        val residentKey = readBoolean(options, "f2641a", "a")
+        val userVerification = readBoolean(options, "f2642b", "b")
+        if (residentKey != null || userVerification != null) {
+            json.put("authenticatorSelection", JSONObject().apply {
+                residentKey?.let { put("residentKey", if (it) "required" else "discouraged") }
+                residentKey?.let { put("requireResidentKey", it) }
+                userVerification?.let { put("userVerification", if (it) "required" else "discouraged") }
+            })
+        }
+        json.put("attestation", "none")
+        return json.toString()
+    }
+
+    private fun readAlgorithm(parameter: Any?): Int? {
+        val algorithm = readField(parameter, "alg") ?: return null
+        return runCatching {
+            (algorithm.javaClass.getMethod("h").invoke(algorithm) as Number).toInt()
+        }.getOrNull()
+    }
+
+    private fun readBoolean(instance: Any?, vararg names: String): Boolean? =
+        (readField(instance, *names) as? Boolean)
+
+    private fun invokeHybridSuccess(callback: Any, bytes: ByteArray) {
+        callback.javaClass.getMethod("a", ByteArray::class.java).invoke(callback, bytes)
+    }
+
+    private fun invokeHybridError(callback: Any, status: Int) {
+        callback.javaClass.getMethod("b", Byte::class.javaPrimitiveType).invoke(callback, status.toByte())
+    }
+
+    private fun encodeBase64Url(bytes: ByteArray): String =
+        Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+
+    private fun decodeBase64Url(value: String): ByteArray =
+        Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
 
     private fun describeHybridRequest(request: Any?): String {
         if (request == null) return "null"
