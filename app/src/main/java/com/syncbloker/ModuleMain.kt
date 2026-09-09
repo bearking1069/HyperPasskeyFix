@@ -109,6 +109,7 @@ class ModuleMain : XposedModule() {
                     safeHook("fidoSync") { hookSyncEnableFido() }
                     safeHook("nokNokWhitelist") { hookNokNokWhitelist(param) }
                     safeHook("vendorValidate") { hookFidoVendorValidate(param) }
+                    safeHook("fidoHybridBoundaryProbe") { hookFidoHybridBoundaryProbe(param) }
                 }
                 TARGET_PACKAGE_CREDMAN -> {
                     val redirect = CredManUiRedirect(this) { priority, msg, t ->
@@ -560,6 +561,91 @@ class ModuleMain : XposedModule() {
         } finally {
             bridge.close()
         }
+    }
+
+    /**
+     * 扫码连电脑的只读探针：记录 Hybrid CTAP 请求进入本地 authenticator 的边界，
+     * 不改变任何返回值或控制流。这个位置用于确认：电脑请求是否已经解析成 b3.u，
+     * 以及在真正生成/保存凭据前当前选择的 authenticator 是谁。
+     */
+    private fun hookFidoHybridBoundaryProbe(param: PackageReadyParam) {
+        val cl = param.classLoader
+        val requestClass = Class.forName("b3.m0", false, cl)
+        // JADX 展示名是 InterfaceC0115a，但 dex 的真实内部类名是 m2.a$a。
+        val callbackClass = Class.forName("m2.a\$a", false, cl)
+        val executorClass = Class.forName("j2.h", false, cl)
+        val strategyClass = Class.forName("m2.d", false, cl)
+        val boundary = strategyClass.getDeclaredMethod(
+            "h",
+            executorClass,
+            requestClass,
+            callbackClass,
+        ).apply { isAccessible = true }
+
+        hook(boundary)
+            .setPriority(XposedInterface.PRIORITY_LOWEST)
+            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+            .intercept { chain ->
+                val request = chain.getArg(1)
+                log(Log.INFO, TAG, "QR boundary request=${describeHybridRequest(request)}")
+                chain.proceed()
+            }
+
+        // 同一条链路的下一层：读取当前将实际执行的 authenticator，仅用于确认是否仍是小米 passkey。
+        val teeClass = Class.forName("a2.a", false, cl)
+        val exec = teeClass.getDeclaredMethod("exec", Byte::class.javaPrimitiveType, requestClass)
+            .apply { isAccessible = true }
+        val getAuthenticator = teeClass.getDeclaredMethod("getAuthenticator")
+            .apply { isAccessible = true }
+
+        hook(exec)
+            .setPriority(XposedInterface.PRIORITY_LOWEST)
+            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+            .intercept { chain ->
+                val authenticator = runCatching {
+                    getAuthenticator.invoke(chain.thisObject)?.javaClass?.name
+                }.getOrNull()
+                log(
+                    Log.INFO,
+                    TAG,
+                    "QR authenticator exec command=${chain.getArg(0)} selected=$authenticator " +
+                        "request=${describeHybridRequest(chain.getArg(1))}",
+                )
+                chain.proceed()
+            }
+
+        log(Log.INFO, TAG, "hooked FIDO Hybrid boundary probe")
+    }
+
+    private fun describeHybridRequest(request: Any?): String {
+        if (request == null) return "null"
+        val type = request.javaClass.name
+        if (type != "b3.u") return "type=$type"
+        // JADX 显示的是反混淆字段名，运行时 dex 中仍是 a/b/c。
+        val clientDataHash = readField(request, "f2631a", "a") as? ByteArray
+        val rp = readField(request, "f2632b", "b")
+        val user = readField(request, "f2633c", "c")
+        val rpId = readField(rp, "id") as? String
+        val userId = readField(user, "id") as? ByteArray
+        return "type=$type hashBytes=${clientDataHash?.size ?: -1} " +
+            "rpId=$rpId userIdBytes=${userId?.size ?: -1}"
+    }
+
+    private fun readField(instance: Any?, vararg names: String): Any? {
+        if (instance == null) return null
+        for (name in names) {
+            var type: Class<*>? = instance.javaClass
+            while (type != null) {
+                try {
+                    return type.getDeclaredField(name).apply { isAccessible = true }.get(instance)
+                } catch (_: NoSuchFieldException) {
+                    type = type.superclass
+                } catch (_: Throwable) {
+                    break
+                }
+            }
+        }
+        return null
     }
 
     private fun hookReturnsTrue(
