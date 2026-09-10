@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "SyncBloker"
+rootProject.name = "HyperPasskeyFixAosp"
 include(":app")

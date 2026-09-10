@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">SyncBloker</string>
-    <string name="module_description">绕过小米密码管理“未开启密码管家禁止使用通行密钥”的校验</string>
+    <string name="app_name">澎湃通行密钥解锁</string>
+    <string name="module_description">恢复澎湃 OS 的 AOSP 凭据选择界面，解除第三方通行密钥及扫码跨设备创建与登录限制</string>
 </resources>
